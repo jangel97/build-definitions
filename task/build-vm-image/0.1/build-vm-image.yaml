@@ -239,6 +239,19 @@ spec:
         mkdir output
         buildah_retries=3
 
+        # DEBUG: Check if STORAGE_DRIVER parameter is being honored
+        echo "=== DEBUG: Checking storage driver BEFORE anything else ==="
+        echo "STORAGE_DRIVER parameter was set to: $STORAGE_DRIVER"
+        echo "=== Checking podman storage driver on VM ==="
+        sudo podman info | grep graphDriverName
+        echo "=== Checking buildah storage driver inside container ==="
+        sudo podman run --rm \
+          -v /var/lib/containers/storage:/var/lib/containers/storage \
+          $BUILDAH_IMAGE \
+          buildah info --format='{{.store.GraphDriverName}}'
+        echo "=== DEBUG: Exiting early to avoid full build ==="
+        exit 1
+
         # Register with subscription manager if activation key is provided
         # This happens on the remote VM inside a container to ensure correct architecture-specific repos
         # We run it in a container (as root) to avoid sudo password requirements
