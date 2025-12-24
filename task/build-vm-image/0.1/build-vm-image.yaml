@@ -82,11 +82,13 @@ spec:
         name: varlibcontainers
   steps:
     - name: use-trusted-artifact
+      onError: continue
       image: quay.io/konflux-ci/build-trusted-artifacts:latest@sha256:7d829000642752a739f7823b1981e5bcfbc70da48d473f04b624ec8bf784322b
       args:
         - use
         - $(params.SOURCE_ARTIFACT)=/var/workdir/source
     - name: validate-bib-config
+      onError: continue
       image: quay.io/konflux-ci/yq:latest@sha256:5ec48a4b1e7489e74547113688a36517fa1cce0d90fd26055b08b970cfafbacc
       script: |-
         #!/bin/bash
@@ -145,32 +147,44 @@ spec:
 
         # get values stored from previous task
         echo "vars file"
-        cat /var/workdir/vars
-        source /var/workdir/vars
+        if [ -f /var/workdir/vars ]; then
+          cat /var/workdir/vars
+          source /var/workdir/vars
+        else
+          echo "vars file not found, creating dummy values for debug"
+          mkdir -p /var/workdir
+          echo 'declare BOOTC_BUILDER_IMAGE=quay.io/centos-bootc/bootc-image-builder:latest' > /var/workdir/vars
+          echo 'declare SOURCE_IMAGE=quay.io/centos-bootc/centos-bootc:stream9' >> /var/workdir/vars
+          echo 'declare TAGGED_AS=quay.io/centos-bootc/centos-bootc:stream9' >> /var/workdir/vars
+          source /var/workdir/vars
+        fi
         echo "Vars:"
         echo BOOTC_BUILDER_IMAGE $BOOTC_BUILDER_IMAGE
         echo SOURCE_IMAGE $SOURCE_IMAGE
         echo TAGGED_AS $TAGGED_AS
 
-        mkdir -p ~/.ssh
+        export HOME=/var/workdir
+        mkdir -p $HOME/.ssh
         if [ -e "/ssh/error" ]; then
           #no server could be provisioned
           cat /ssh/error
           exit 1
         elif [ -e "/ssh/otp" ]; then
-          curl --cacert /ssh/otp-ca -XPOST -d @/ssh/otp $(cat /ssh/otp-server) >~/.ssh/id_rsa
-          echo "" >> ~/.ssh/id_rsa
+          curl --cacert /ssh/otp-ca -XPOST -d @/ssh/otp $(cat /ssh/otp-server) >$HOME/.ssh/id_rsa
+          echo "" >> $HOME/.ssh/id_rsa
         else
-          cp /ssh/id_rsa ~/.ssh
+          cp /ssh/id_rsa $HOME/.ssh
         fi
-        chmod 0400 ~/.ssh/id_rsa
+        chmod 0400 $HOME/.ssh/id_rsa
         export SSH_HOST=$(cat /ssh/host)
         export BUILD_DIR=$(cat /ssh/user-dir)
-        export SSH_ARGS=(-o StrictHostKeyChecking=no -o ServerAliveInterval=60)
+        export SSH_ARGS=(-i $HOME/.ssh/id_rsa -o StrictHostKeyChecking=no -o ServerAliveInterval=60)
+        cd /var/workdir
         mkdir -p scripts
         echo "$BUILD_DIR"
         ssh -v "${SSH_ARGS[@]}" "$SSH_HOST"  mkdir -p "$BUILD_DIR/workspaces" "$BUILD_DIR/scripts" "$BUILD_DIR/tmp" "$BUILD_DIR/tekton-results" "$BUILD_DIR/entitlement" "$BUILD_DIR/activation-key"
 
+        mkdir -p /var/workdir/source
         if [ ! -n "${CONFIG_TOML_FILE}" ]; then
           echo "No CONFIG_TOML_FILE specified"
           export CONFIG_TOML_FILE=config.toml
@@ -186,15 +200,16 @@ spec:
         cat /var/workdir/source/$CONFIG_TOML_FILE
 
 
-        rsync -ra "/var/workdir/source/$CONFIG_TOML_FILE" "$SSH_HOST:$BUILD_DIR/config.toml"
-        rsync -ra "$HOME/.docker/" "$SSH_HOST:$BUILD_DIR/.docker/"
+        rsync -ra -e "ssh ${SSH_ARGS[*]}" "/var/workdir/source/$CONFIG_TOML_FILE" "$SSH_HOST:$BUILD_DIR/config.toml"
+        mkdir -p $HOME/.docker
+        rsync -ra -e "ssh ${SSH_ARGS[*]}" "$HOME/.docker/" "$SSH_HOST:$BUILD_DIR/.docker/"
         # Rsync activation-key for remote registration or entitlement certificates if provided
         if [ -e "/activation-key/org" ]; then
           echo "Syncing activation-key for remote registration"
-          rsync -ra /activation-key/ "$SSH_HOST:$BUILD_DIR/activation-key/"
+          rsync -ra -e "ssh ${SSH_ARGS[*]}" /activation-key/ "$SSH_HOST:$BUILD_DIR/activation-key/"
         elif [ -d "/entitlement" ] && [ "$(ls -A /entitlement)" ]; then
           echo "Syncing provided entitlement certificates"
-          rsync -ra /entitlement/ "$SSH_HOST:$BUILD_DIR/entitlement/"
+          rsync -ra -e "ssh ${SSH_ARGS[*]}" /entitlement/ "$SSH_HOST:$BUILD_DIR/entitlement/"
         fi
 
         if [ "${IMAGE_APPEND_PLATFORM}" == "true" ]; then
@@ -212,6 +227,18 @@ spec:
         cat >scripts/script-build.sh <<REMOTESSHEOF
         #!/bin/sh
         set -e
+
+        echo "=== DEBUG: Checking storage driver BEFORE anything else ==="
+        echo "STORAGE_DRIVER parameter was set to: $STORAGE_DRIVER"
+        echo "=== Checking podman storage driver on VM ==="
+        podman info | grep graphDriverName
+        echo "=== Checking buildah storage driver inside container ==="
+        podman run --rm \
+          -v /var/lib/containers/storage:/var/lib/containers/storage \
+          $BUILDAH_IMAGE \
+          buildah info --format='{{.store.GraphDriverName}}'
+        echo "=== DEBUG: Exiting early to avoid full build ==="
+        exit 1
 
         # this prevents the container from using podman-subscripition-mananger magic,
         # so that it will use certificates from /etc/pki/entitlements
@@ -399,11 +426,11 @@ spec:
         # make scripts executable and sync them to the cloud VM.
         chmod +x scripts/script-build.sh
         chmod +x scripts/script-push.sh
-        rsync -ra scripts "$SSH_HOST:$BUILD_DIR"
-        rsync -ra /var/workdir/source/ "$SSH_HOST:$BUILD_DIR/workspaces/source/"
+        rsync -ra -e "ssh ${SSH_ARGS[*]}" scripts "$SSH_HOST:$BUILD_DIR"
+        rsync -ra -e "ssh ${SSH_ARGS[*]}" /var/workdir/source/ "$SSH_HOST:$BUILD_DIR/workspaces/source/"
 
         ssh -v "${SSH_ARGS[@]}" "$SSH_HOST" "$BUILD_DIR/scripts/script-build.sh"
-        rsync -ra "$SSH_HOST:$BUILD_DIR/tekton-results/" "/tekton/results/"
+        rsync -ra -e "ssh ${SSH_ARGS[*]}" "$SSH_HOST:$BUILD_DIR/tekton-results/" "/tekton/results/"
 
       volumeMounts:
         - mountPath: /ssh
